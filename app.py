@@ -106,7 +106,8 @@ def pack_cargo(cargo_df, container_type, start_num=1):
     container_no = start_num
     
     # 按体积从大到小装箱（优化空间利用率）
-    for idx, row in df.iterrows():
+    df_sorted = df.sort_values("体积", ascending=False).reset_index(drop=True)
+    for idx, row in df_sorted.iterrows():
         cargo_volume = row["体积"]
         cargo_weight = row["毛重(kg)"]
         
@@ -138,8 +139,10 @@ def pack_cargo(cargo_df, container_type, start_num=1):
     # 给货物分配柜号
     for plan in loading_result:
         for idx in current_cargo:
-            df.at[idx, "柜号"] = plan["柜号"]
+            df_sorted.at[idx, "柜号"] = plan["柜号"]
     
+    # 恢复原索引
+    df = df_sorted.set_index(df.index).sort_index()
     return df, loading_result
 
 # ====================== 主程序 ======================
@@ -191,20 +194,29 @@ else:
                 st.session_state.cargo = pd.concat([st.session_state.cargo, new_row], ignore_index=True)
                 st.success(f"✅ 已添加：{cargo_name}")
         
-        # Excel导入
+        # Excel导入（优化依赖兼容）
         with st.expander("📤 Excel批量导入", expanded=False):
-            uploaded_file = st.file_uploader("上传货物清单Excel", type=["xlsx"])
+            uploaded_file = st.file_uploader("上传货物清单Excel", type=["xlsx", "xls"])
             if uploaded_file:
-                st.info("🔍 正在智能解析Excel文件（支持多sheet、多表头）")
+                st.info("🔍 正在智能解析Excel文件（支持.xlsx/.xls、多sheet、多表头）")
                 try:
+                    # 根据文件后缀选择引擎，避免依赖报错
+                    file_ext = uploaded_file.name.split(".")[-1].lower()
+                    engine = "openpyxl" if file_ext == "xlsx" else "xlrd"
+                    
                     # 智能读取多sheet、多表头
                     dfs = []
-                    excel_file = pd.ExcelFile(uploaded_file)
+                    excel_file = pd.ExcelFile(uploaded_file, engine=engine)
                     for sheet_name in excel_file.sheet_names:
                         # 尝试前4行作为表头
                         for header_row in range(4):
                             try:
-                                df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=header_row)
+                                df = pd.read_excel(
+                                    uploaded_file, 
+                                    sheet_name=sheet_name, 
+                                    header=header_row,
+                                    engine=engine
+                                )
                                 dfs.append(df)
                             except:
                                 continue
@@ -250,7 +262,7 @@ else:
                     else:
                         st.error("❌ 未识别到有效货物数据，请检查Excel格式")
                 except Exception as e:
-                    st.error(f"❌ 导入失败：{str(e)}")
+                    st.error(f"❌ 导入失败：{str(e)}\n建议：确保安装了 xlrd 和 openpyxl 依赖包")
         
         # 展示当前清单
         st.subheader("📋 当前货物清单")
@@ -387,7 +399,7 @@ else:
             st.subheader("📦 导出货物清单")
             # 准备导出数据（添加柜号）
             export_cargo = st.session_state.cargo.copy()
-            # 导出Excel
+            # 导出Excel（指定openpyxl引擎，避免依赖问题）
             cargo_buffer = io.BytesIO()
             with pd.ExcelWriter(cargo_buffer, engine="openpyxl") as writer:
                 export_cargo.to_excel(writer, sheet_name="货物清单", index=False)
