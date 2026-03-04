@@ -5,7 +5,7 @@ import io
 import re
 from collections import defaultdict
 
-# ====================== 基础配置 ======================
+# ====================== 基础配置（全版本兼容） ======================
 st.set_page_config(page_title="货代通用智能配箱系统", layout="wide")
 if "state" not in st.session_state:
     st.session_state.state = {
@@ -14,12 +14,13 @@ if "state" not in st.session_state:
         "parse_log": []  # 识别日志，便于调试
     }
 
-# ====================== 登录模块 ======================
+# ====================== 登录模块（移除新版参数） ======================
 def login():
     st.title("🔐 货代通用智能配箱系统")
     col1, col2, col3 = st.columns([0.3, 0.4, 0.3])
     with col2:
-        if st.button("免密登录（测试/生产可用）", type="primary", use_container_width=True):
+        # 移除 use_container_width 参数，兼容低版本
+        if st.button("免密登录（测试/生产可用）", type="primary"):
             st.session_state.state["logged_in"] = True
             st.rerun()
 
@@ -267,18 +268,18 @@ def calculate_container(cargo_df: pd.DataFrame, container_type: str = "40HQ") ->
 
     return result_df
 
-# ====================== 主界面（用户友好，支持调试） ======================
+# ====================== 主界面（移除所有新版参数） ======================
 def main_interface():
     st.markdown("## 📦 货代通用智能配箱系统（适配所有Excel模板）")
     st.divider()
 
-    # 1. 文件上传区
+    # 1. 文件上传区（移除 use_container_width 参数）
     col_upload = st.columns([1])[0]
     with col_upload:
         uploaded_file = st.file_uploader(
             "上传Excel清单（.xls/.xlsx，支持：标准清单/项目清单/乱序清单）",
-            type=["xlsx", "xls"],
-            use_container_width=True
+            type=["xlsx", "xls"]
+            # 移除 use_container_width=True，兼容低版本
         )
 
     # 2. 解析与结果展示
@@ -310,10 +311,11 @@ def main_interface():
                 container_type = st.selectbox(
                     "选择集装箱类型",
                     ["20GP", "40GP", "40HQ", "45HQ", "10GP"],
-                    index=2,
-                    use_container_width=True
+                    index=2
+                    # 移除 use_container_width 参数
                 )
-                calc_btn = st.button("🚀 开始配箱", type="primary", use_container_width=True)
+                # 移除 use_container_width 参数
+                calc_btn = st.button("🚀 开始配箱", type="primary")
 
             if calc_btn:
                 with st.spinner("📊 计算最优配箱方案..."):
@@ -334,11 +336,11 @@ def main_interface():
                         result_df.drop(columns=["行号"], errors="ignore").to_excel(writer, sheet_name="配箱结果", index=False)
                         # 工作表2：配箱统计
                         st.session_state.state["container_stats"].to_excel(writer, sheet_name="配箱统计")
+                    # 移除 use_container_width 参数
                     st.download_button(
                         label="下载配箱结果（Excel，兼容MS Office/WPS）",
                         data=buffer,
                         file_name=f"货代配箱结果_{container_type}_{pd.Timestamp.now().strftime('%Y%m%d')}.xlsx",
-                        use_container_width=True,
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
         else:
