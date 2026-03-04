@@ -4,6 +4,7 @@ import numpy as np
 import io
 import hashlib
 from datetime import datetime
+import os
 
 # ====================== 页面配置 ======================
 st.set_page_config(
@@ -145,6 +146,35 @@ def pack_cargo(cargo_df, container_type, start_num=1):
     df = df_sorted.set_index(df.index).sort_index()
     return df, loading_result
 
+# ====================== 安全读取Excel/CSV文件 ======================
+def safe_read_file(uploaded_file):
+    """容错读取Excel/CSV文件，处理各种格式问题"""
+    try:
+        # 获取文件名和后缀
+        file_name = uploaded_file.name
+        file_ext = file_name.split(".")[-1].lower()
+        
+        # 情况1：CSV文件（包括改后缀的CSV）
+        if file_ext in ["csv", "txt"]:
+            df = pd.read_csv(uploaded_file, encoding="utf-8")
+            return df
+        # 情况2：Excel文件（.xlsx/.xls）
+        elif file_ext == "xlsx":
+            df = pd.read_excel(uploaded_file, engine="openpyxl")
+            return df
+        elif file_ext == "xls":
+            df = pd.read_excel(uploaded_file, engine="xlrd")
+            return df
+        # 情况3：其他后缀，尝试按Excel/CSV依次读取
+        else:
+            try:
+                return pd.read_excel(uploaded_file, engine="openpyxl")
+            except:
+                return pd.read_csv(uploaded_file, encoding="utf-8")
+    except Exception as e:
+        st.error(f"读取文件失败：{str(e)}")
+        return None
+
 # ====================== 主程序 ======================
 if not st.session_state.logged_in:
     # 未登录时显示登录页
@@ -194,75 +224,92 @@ else:
                 st.session_state.cargo = pd.concat([st.session_state.cargo, new_row], ignore_index=True)
                 st.success(f"✅ 已添加：{cargo_name}")
         
-        # Excel导入（优化依赖兼容）
-        with st.expander("📤 Excel批量导入", expanded=False):
-            uploaded_file = st.file_uploader("上传货物清单Excel", type=["xlsx", "xls"])
+        # Excel/CSV导入（超强容错）
+        with st.expander("📤 文件批量导入（支持Excel/CSV）", expanded=False):
+            uploaded_file = st.file_uploader(
+                "上传货物清单（支持.xlsx/.xls/.csv/.txt）", 
+                type=["xlsx", "xls", "csv", "txt"]
+            )
+            
             if uploaded_file:
-                st.info("🔍 正在智能解析Excel文件（支持.xlsx/.xls、多sheet、多表头）")
-                try:
-                    # 根据文件后缀选择引擎，避免依赖报错
-                    file_ext = uploaded_file.name.split(".")[-1].lower()
-                    engine = "openpyxl" if file_ext == "xlsx" else "xlrd"
+                st.info("🔍 正在智能解析文件...")
+                
+                # 第一步：安全读取文件
+                df = safe_read_file(uploaded_file)
+                if df is None or df.empty:
+                    st.error("❌ 文件为空或无法解析，请检查文件格式")
+                    st.stop()
+                
+                # 第二步：智能识别列（兼容各种表头）
+                imported_rows = []
+                # 统一列名（转小写，方便识别）
+                df.columns = [str(col).lower().replace(" ", "") for col in df.columns]
+                
+                for _, row in df.iterrows():
+                    row = row.fillna("")
+                    # 初始化数据
+                    name = ""
+                    L = W = H = G = N = 0.0
                     
-                    # 智能读取多sheet、多表头
-                    dfs = []
-                    excel_file = pd.ExcelFile(uploaded_file, engine=engine)
-                    for sheet_name in excel_file.sheet_names:
-                        # 尝试前4行作为表头
-                        for header_row in range(4):
-                            try:
-                                df = pd.read_excel(
-                                    uploaded_file, 
-                                    sheet_name=sheet_name, 
-                                    header=header_row,
-                                    engine=engine
-                                )
-                                dfs.append(df)
-                            except:
-                                continue
+                    # 识别货物名称（兼容各种写法）
+                    name_cols = ["货物名称", "品名", "名称", "货名", "goodsname", "name"]
+                    for col in name_cols:
+                        if col in df.columns and str(row[col]).strip() and not name:
+                            name = str(row[col]).strip()
+                            break
                     
-                    # 提取货物数据
-                    imported_rows = []
-                    for df in dfs:
-                        df = df.fillna("")
-                        for _, row in df.iterrows():
-                            # 自动识别列（品名、长、宽、高、毛重、净重）
-                            name = ""
-                            L = W = H = G = N = 0.0
-                            for col_idx, col_name in enumerate(df.columns):
-                                col_text = str(col_name).lower()
-                                cell_value = row[col_idx]
-                                # 识别货物名称
-                                if any(key in col_text for key in ["品名", "名称", "货物", "货名"]) and not name:
-                                    name = str(cell_value).strip()
-                                # 识别尺寸
-                                elif any(key in col_text for key in ["长", "length"]) and L == 0:
-                                    L = float(cell_value) if str(cell_value).replace(".","").isdigit() else 0.0
-                                elif any(key in col_text for key in ["宽", "width"]) and W == 0:
-                                    W = float(cell_value) if str(cell_value).replace(".","").isdigit() else 0.0
-                                elif any(key in col_text for key in ["高", "height"]) and H == 0:
-                                    H = float(cell_value) if str(cell_value).replace(".","").isdigit() else 0.0
-                                # 识别重量
-                                elif any(key in col_text for key in ["毛重", "gw"]) and G == 0:
-                                    G = float(cell_value) if str(cell_value).replace(".","").isdigit() else 0.0
-                                elif any(key in col_text for key in ["净重", "nw"]) and N == 0:
-                                    N = float(cell_value) if str(cell_value).replace(".","").isdigit() else 0.0
-                            
-                            # 有效数据才导入
-                            if name and (L > 0 or W > 0 or H > 0):
-                                imported_rows.append([
-                                    name, L, W, H, G, N, "", f"导入自：{uploaded_file.name}"
-                                ])
+                    # 识别长度（兼容各种写法）
+                    len_cols = ["长", "长度", "length", "l"]
+                    for col in len_cols:
+                        if col in df.columns and str(row[col]).replace(".","").isdigit() and L == 0:
+                            L = float(row[col])
+                            break
                     
-                    # 更新清单
-                    if imported_rows:
-                        import_df = pd.DataFrame(imported_rows, columns=st.session_state.cargo.columns)
-                        st.session_state.cargo = import_df
-                        st.success(f"✅ 导入成功！共 {len(imported_rows)} 条货物数据")
-                    else:
-                        st.error("❌ 未识别到有效货物数据，请检查Excel格式")
-                except Exception as e:
-                    st.error(f"❌ 导入失败：{str(e)}\n建议：确保安装了 xlrd 和 openpyxl 依赖包")
+                    # 识别宽度
+                    wid_cols = ["宽", "宽度", "width", "w"]
+                    for col in wid_cols:
+                        if col in df.columns and str(row[col]).replace(".","").isdigit() and W == 0:
+                            W = float(row[col])
+                            break
+                    
+                    # 识别高度
+                    hei_cols = ["高", "高度", "height", "h"]
+                    for col in hei_cols:
+                        if col in df.columns and str(row[col]).replace(".","").isdigit() and H == 0:
+                            H = float(row[col])
+                            break
+                    
+                    # 识别毛重
+                    gw_cols = ["毛重", "总重", "grossweight", "gw", "weight"]
+                    for col in gw_cols:
+                        if col in df.columns and str(row[col]).replace(".","").isdigit() and G == 0:
+                            G = float(row[col])
+                            break
+                    
+                    # 识别净重
+                    nw_cols = ["净重", "netweight", "nw"]
+                    for col in nw_cols:
+                        if col in df.columns and str(row[col]).replace(".","").isdigit() and N == 0:
+                            N = float(row[col])
+                            break
+                    
+                    # 有效数据才导入
+                    if name and (L > 0 or W > 0 or H > 0):
+                        imported_rows.append([
+                            name, L, W, H, G, N, "", f"导入自：{uploaded_file.name}"
+                        ])
+                
+                # 第三步：导入数据
+                if imported_rows:
+                    import_df = pd.DataFrame(imported_rows, columns=st.session_state.cargo.columns)
+                    st.session_state.cargo = import_df
+                    st.success(f"✅ 导入成功！共 {len(imported_rows)} 条货物数据")
+                    
+                    # 预览导入结果
+                    with st.expander("👀 预览导入数据"):
+                        st.dataframe(import_df, use_container_width=True, hide_index=True)
+                else:
+                    st.error("❌ 未识别到有效货物数据，请检查文件列名（至少包含：货物名称+长/宽/高）")
         
         # 展示当前清单
         st.subheader("📋 当前货物清单")
