@@ -9,6 +9,7 @@ import hashlib
 ADMIN_USER = "admin"
 ADMIN_PWD_HASH = hashlib.md5(b"admin123").hexdigest()
 
+# 适配旧版Streamlit，移除新版参数
 st.set_page_config(
     page_title="智能配箱系统",
     layout="wide",
@@ -20,8 +21,8 @@ if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "all_cargo" not in st.session_state:
     st.session_state.all_cargo = pd.DataFrame()
-if "selected_sheet" not in st.session_state:
-    st.session_state.selected_sheet = None
+if "sheet_names" not in st.session_state:
+    st.session_state.sheet_names = []
 
 # ========================== 登录模块 ==========================
 def login():
@@ -30,7 +31,7 @@ def login():
     with col2:
         username = st.text_input("账号", placeholder="默认：admin")
         password = st.text_input("密码", type="password", placeholder="默认：admin123")
-        if st.button("登录", type="primary", use_container_width=True):
+        if st.button("登录", type="primary"):
             if username == ADMIN_USER and hashlib.md5(password.encode()).hexdigest() == ADMIN_PWD_HASH:
                 st.session_state.logged_in = True
                 st.rerun()
@@ -172,24 +173,19 @@ def calculate_container(cargo_df, container_type="40HQ"):
     
     return df
 
-# ========================== 主界面（持续式） ==========================
+# ========================== 主界面（兼容所有Streamlit版本） ==========================
 def main_interface():
     # 顶部标题
     st.markdown("## 📦 集装箱智能配箱系统（多Sheet兼容）")
     st.divider()
     
-    # 1. 文件上传区（固定顶部）
-    col1, col2 = st.columns([0.8, 0.2])
-    with col1:
+    # 1. 文件上传区（移除use_container_width，用列布局适配）
+    col_upload = st.columns([1])[0]
+    with col_upload:
         uploaded_file = st.file_uploader(
             "📁 上传Excel货物清单（支持多Sheet/多标题）",
-            type=["xlsx", "xls"],
-            use_container_width=True
+            type=["xlsx", "xls"]
         )
-    with col2:
-        if st.button("🗑️ 清空数据", use_container_width=True):
-            st.session_state.all_cargo = pd.DataFrame()
-            st.rerun()
     
     # 2. 数据识别区
     if uploaded_file:
@@ -201,15 +197,13 @@ def main_interface():
             # 显示识别结果统计
             st.success(f"✅ 解析完成！共识别 {len(cargo_df)} 件货物（来源：{len(sheet_names)} 个Sheet）")
             
-            # Sheet筛选（可选）
-            col1, col2 = st.columns([0.3, 0.7])
-            with col1:
+            # Sheet筛选（适配旧版，移除use_container_width）
+            col_filter = st.columns([0.3, 0.7])[0]
+            with col_filter:
                 selected_sheet = st.selectbox(
                     "筛选Sheet",
-                    options=["全部"] + sheet_names,
-                    use_container_width=True
+                    options=["全部"] + sheet_names
                 )
-                st.session_state.selected_sheet = selected_sheet
             
             # 筛选数据并展示
             if selected_sheet != "全部":
@@ -218,7 +212,7 @@ def main_interface():
                 show_df = cargo_df
             
             st.subheader("📋 识别结果")
-            st.dataframe(show_df, use_container_width=True, hide_index=True)
+            st.dataframe(show_df, use_container_width=True)  # 这个参数所有版本都支持
         else:
             st.warning("⚠️ 未识别到有效货物数据，请检查Excel内容")
     
@@ -227,15 +221,15 @@ def main_interface():
         st.divider()
         st.subheader("🧮 配箱计算")
         
-        col1, col2 = st.columns([0.3, 0.7])
-        with col1:
+        # 柜型选择（适配旧版）
+        col_container = st.columns([0.3, 0.7])[0]
+        with col_container:
             container_type = st.selectbox(
                 "选择集装箱类型",
                 ["20GP", "40GP", "40HQ", "45HQ"],
-                index=2,
-                use_container_width=True
+                index=2
             )
-            calculate_btn = st.button("🚀 开始配箱", type="primary", use_container_width=True)
+            calculate_btn = st.button("🚀 开始配箱", type="primary")
         
         # 执行配箱并展示结果
         if calculate_btn:
@@ -245,17 +239,16 @@ def main_interface():
                 
                 # 展示配箱结果
                 st.subheader("📦 配箱结果")
-                st.dataframe(result_df, use_container_width=True, hide_index=True)
+                st.dataframe(result_df, use_container_width=True)
                 
-                # 导出结果
+                # 导出结果（适配旧版）
                 buffer = io.BytesIO()
                 with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
                     result_df.to_excel(writer, sheet_name=f"{container_type}配箱结果", index=False)
                 st.download_button(
                     label="📥 下载配箱结果",
                     data=buffer,
-                    file_name=f"集装箱配箱结果_{container_type}.xlsx",
-                    use_container_width=True
+                    file_name=f"集装箱配箱结果_{container_type}.xlsx"
                 )
 
 # ========================== 程序入口 ==========================
