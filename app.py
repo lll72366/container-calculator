@@ -3,260 +3,185 @@ import pandas as pd
 import numpy as np
 import io
 import re
-import hashlib
+from pdfminer.high_level import extract_text
+from PIL import Image
+import pytesseract
 
-# ========================== 基础配置 ==========================
-ADMIN_USER = "admin"
-ADMIN_PWD_HASH = hashlib.md5(b"admin123").hexdigest()
+# ====================== 页面配置（全版本兼容） ======================
+st.set_page_config(page_title="智能配箱系统", layout="wide")
 
-# 适配旧版Streamlit，移除新版参数
-st.set_page_config(
-    page_title="智能配箱系统",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+# ====================== 登录 ======================
+if "login" not in st.session_state:
+    st.session_state.login = False
 
-# ========================== 会话状态 ==========================
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "all_cargo" not in st.session_state:
-    st.session_state.all_cargo = pd.DataFrame()
-if "sheet_names" not in st.session_state:
-    st.session_state.sheet_names = []
-
-# ========================== 登录模块 ==========================
 def login():
-    st.title("🔐 集装箱智能配箱系统")
-    col1, col2, col3 = st.columns([0.2, 0.6, 0.2])
-    with col2:
-        username = st.text_input("账号", placeholder="默认：admin")
-        password = st.text_input("密码", type="password", placeholder="默认：admin123")
-        if st.button("登录", type="primary"):
-            if username == ADMIN_USER and hashlib.md5(password.encode()).hexdigest() == ADMIN_PWD_HASH:
-                st.session_state.logged_in = True
-                st.rerun()
-            else:
-                st.error("❌ 账号或密码错误")
+    st.title("🔐 智能配箱系统")
+    account = st.text_input("账号")
+    pwd = st.text_input("密码", type="password")
+    if st.button("登录"):
+        if account == "admin" and pwd == "admin123":
+            st.session_state.login = True
+            st.rerun()
+        else:
+            st.error("账号或密码错误")
 
-# ========================== 核心：多Sheet+多标题识别引擎 ==========================
-def is_title_row(row_text):
-    """判断是否为标题行（过滤无效标题/空行）"""
-    title_keywords = ["货物名称", "长", "宽", "高", "毛重", "净重", "品名", "规格", "重量", "尺寸"]
-    empty_keywords = ["nan", "", "无", "空"]
-    
-    # 标题行包含至少2个标题关键词，且不包含有效数字
-    has_title = any(kw in row_text for kw in title_keywords)
-    has_valid_num = bool(re.search(r'\d+\.?\d*', row_text))
-    is_empty = all(kw in row_text.lower() for kw in empty_keywords)
-    
-    return has_title and not has_valid_num and not is_empty
+if not st.session_state.login:
+    login()
+    st.stop()
 
-def extract_cargo_info(text):
-    """提取单单元格/单行的货物信息"""
-    s = str(text).lower().strip()
-    if s in ["", "nan", "无"]:
-        return None
-    
-    # 提取数字
-    nums = re.findall(r'\d+\.?\d*', s)
-    if len(nums) < 3:  # 至少需要长宽高3个数字
-        return None
-    
-    # 提取货物名称
-    name_pattern = r'[0-9.×*x:：()（）cm mm kg g 吨 公斤 克 长 宽 高 厚 毛重 净重]'
-    name = re.sub(name_pattern, '', s).strip()
-    name = name if name else "未知货物"
-    
-    # 提取长宽高
-    length = width = height = 0.0
-    # 格式1：长50/长:50
-    len_match = re.search(r'长[:：= ]*(\d+\.?\d*)', s)
-    wid_match = re.search(r'宽[:：= ]*(\d+\.?\d*)', s)
-    hei_match = re.search(r'高[:：= ]*(\d+\.?\d*)', s)
-    # 格式2：50×40×30
-    dim_match = re.search(r'(\d+\.?\d*)[×*x× ]+(\d+\.?\d*)[×*x× ]+(\d+\.?\d*)', s)
-    
-    if len_match: length = float(len_match.group(1))
-    if wid_match: width = float(wid_match.group(1))
-    if hei_match: height = float(hei_match.group(1))
-    
-    # 补充连续三个数字
-    if length == 0 and width == 0 and height == 0 and dim_match:
-        length = float(dim_match.group(1))
-        width = float(dim_match.group(2))
-        height = float(dim_match.group(3))
-    
-    # 单位转换（默认cm转mm）
-    if "cm" in s or "公分" in s:
-        length *= 10; width *= 10; height *= 10
-    elif "m" in s:
-        length *= 1000; width *= 1000; height *= 1000
-    
-    # 提取毛重
-    gw = 0.0
-    gw_match = re.search(r'毛重[:：= ]*(\d+\.?\d*)', s) or re.search(r'(\d+\.?\d*) *kg', s)
-    if gw_match:
-        gw = float(gw_match.group(1))
-    
-    # 过滤无效数据
-    if length <= 0 or width <= 0 or height <= 0:
-        return None
-    
-    return {
-        "货物名称": name,
-        "长(mm)": round(length, 2),
-        "宽(mm)": round(width, 2),
-        "高(mm)": round(height, 2),
-        "毛重(kg)": round(gw, 2),
-        "体积(m³)": round(length * width * height / 1e9, 4)
-    }
+# ====================== 工具函数 ======================
+def clean_text(s):
+    return str(s).strip().lower() if str(s).strip() not in ["nan", "None", ""] else ""
 
-def parse_multi_sheet_excel(uploaded_file):
-    """解析多Sheet Excel，自动跳过标题行/空行"""
-    all_cargo = []
-    
-    # 读取所有Sheet名称
-    xl_file = pd.ExcelFile(uploaded_file)
-    sheet_names = xl_file.sheet_names
-    st.session_state.sheet_names = sheet_names
-    
-    # 遍历每个Sheet
-    for sheet_name in sheet_names:
-        # 读取Sheet所有数据（不跳过行）
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, engine="openpyxl", header=None)
-        
-        # 遍历每行，过滤标题行，提取有效数据
-        for idx, row in df.iterrows():
-            # 合并当前行所有单元格文本
-            row_text = " ".join([str(cell) for cell in row if pd.notna(cell)])
-            
-            # 跳过标题行/空行
-            if is_title_row(row_text) or row_text.strip() == "":
+def is_header(text):
+    ht = {"品名","货物名称","长","宽","高","毛重","净重","规格","尺寸","重量"}
+    words = clean_text(text)
+    count = sum([1 for k in ht if k in words])
+    return count >= 2 and not re.search(r'\d{3,}', words)
+
+def extract_size(text):
+    l,w,h = 0.0, 0.0, 0.0
+    t = clean_text(text)
+    # 关键字优先
+    r = re.search(r'长[^0-9]*([0-9.]+)', t)
+    if r: l = float(r.group(1))
+    r = re.search(r'宽[^0-9]*([0-9.]+)', t)
+    if r: w = float(r.group(1))
+    r = re.search(r'高[^0-9]*([0-9.]+)', t)
+    if r: h = float(r.group(1))
+
+    # 三联数字
+    if l == 0 and w == 0 and h == 0:
+        r = re.search(r'(\d+\.?\d)\D*(\d+\.?\d)\D*(\d+\.?\d)', t)
+        if r:
+            l,w,h = float(r.group(1)), float(r.group(2)), float(r.group(3))
+
+    # 单位转 mm
+    if any(x in t for x in ["cm","公分","厘米"]):
+        l*=10;w*=10;h*=10
+    elif any(x in t for x in ["m","米"]):
+        l*=1000;w*=1000;h*=1000
+    return round(l,2), round(w,2), round(h,2)
+
+def extract_weight(text):
+    t = clean_text(text)
+    gw,nw = 0.0,0.0
+    r = re.search(r'毛重[^0-9]*([0-9.]+)',t)
+    if r: gw=float(r.group(1))
+    r = re.search(r'净重[^0-9]*([0-9.]+)',t)
+    if r: nw=float(r.group(1))
+    if gw == 0:
+        r = re.search(r'([0-9.]+)\s*kg',t)
+        if r: gw=float(r.group(1))
+    return round(gw,2), round(nw,2)
+
+def extract_name(text):
+    t = re.sub(r'[\d\s\.\*×:cmkg米公斤吨长宽高毛重净重()]','',clean_text(text))
+    return t if t else "未知货物"
+
+# ====================== 文件解析 ======================
+def parse_excel(file):
+    items = []
+    xl = pd.ExcelFile(file)
+    for sheet in xl.sheet_names:
+        df = pd.read_excel(file, sheet_name=sheet, header=None)
+        for _, row in df.iterrows():
+            line = " ".join([str(x) for x in row if pd.notna(x)])
+            if is_header(line) or not line:
                 continue
-            
-            # 提取货物信息
-            cargo_info = extract_cargo_info(row_text)
-            if cargo_info:
-                cargo_info["来源Sheet"] = sheet_name  # 标记数据来源
-                all_cargo.append(cargo_info)
-    
-    # 转换为DataFrame
-    cargo_df = pd.DataFrame(all_cargo)
-    return cargo_df, sheet_names
+            name = extract_name(line)
+            l,w,h = extract_size(line)
+            gw,nw = extract_weight(line)
+            if l>0 and w>0 and h>0:
+                items.append({
+                    "Sheet": sheet,
+                    "货物名称": name,
+                    "长(mm)": l,
+                    "宽(mm)": w,
+                    "高(mm)": h,
+                    "毛重(kg)": gw,
+                    "净重(kg)": nw,
+                    "体积": round(l*w*h/1e9,4)
+                })
+    return pd.DataFrame(items)
 
-# ========================== 配箱计算 ==========================
-def calculate_container(cargo_df, container_type="40HQ"):
-    """配箱计算，自动分柜"""
-    container_specs = {
-        "20GP": {"max_weight": 21000, "max_volume": 33.2},
-        "40GP": {"max_weight": 26500, "max_volume": 67.7},
-        "40HQ": {"max_weight": 26000, "max_volume": 76.2},
-        "45HQ": {"max_weight": 27500, "max_volume": 86.8}
-    }
-    spec = container_specs[container_type]
-    
-    df = cargo_df.copy().sort_values("体积(m³)", ascending=False)
-    current_weight = 0.0
-    current_volume = 0.0
-    container_no = 1
+def parse_pdf(file):
+    txt = extract_text(io.BytesIO(file.read()))
+    items = []
+    for line in txt.split("\n"):
+        line = line.strip()
+        if not line or is_header(line):
+            continue
+        name = extract_name(line)
+        l,w,h = extract_size(line)
+        gw,nw = extract_weight(line)
+        if l>0 and w>0 and h>0:
+            items.append({
+                "货物名称": name,"长(mm)":l,"宽(mm)":w,"高(mm)":h,
+                "毛重(kg)":gw,"净重(kg)":nw,"体积":round(l*w*h/1e9,4)
+            })
+    return pd.DataFrame(items)
+
+def parse_image(file):
+    img = Image.open(file)
+    txt = pytesseract.image_to_string(img, lang="chi_sim+eng")
+    items = []
+    for line in txt.split("\n"):
+        line = line.strip()
+        if not line or is_header(line):
+            continue
+        name = extract_name(line)
+        l,w,h = extract_size(line)
+        gw,nw = extract_weight(line)
+        if l>0 and w>0 and h>0:
+            items.append({
+                "货物名称": name,"长(mm)":l,"宽(mm)":w,"高(mm)":h,
+                "毛重(kg)":gw,"净重(kg)":nw,"体积":round(l*w*h/1e9,4)
+            })
+    return pd.DataFrame(items)
+
+# ====================== 配箱 ======================
+def pack(df, typ="40HQ"):
+    spec = {"20GP":(21000,33.2),"40GP":(26500,67.7),"40HQ":(26000,76.2),"45HQ":(27500,86.8)}[typ]
+    wl, vl = spec
+    df = df.copy().sort_values("体积", ascending=False)
+    cw, cv, no = 0,0,1
     df["柜号"] = ""
-    
-    for idx, row in df.iterrows():
-        if (current_weight + row["毛重(kg)"] > spec["max_weight"]) or (current_volume + row["体积(m³)"] > spec["max_volume"]):
-            container_no += 1
-            current_weight = 0.0
-            current_volume = 0.0
-        
-        df.loc[idx, "柜号"] = f"{container_type}-{container_no:02d}"
-        current_weight += row["毛重(kg)"]
-        current_volume += row["体积(m³)"]
-    
+    for i, r in df.iterrows():
+        if cw + r["毛重(kg)"] > wl or cv + r["体积"] > vl:
+            no +=1
+            cw,cv =0,0
+        df.loc[i,"柜号"] = f"{typ}-{no:02d}"
+        cw += r["毛重(kg)"]
+        cv += r["体积"]
     return df
 
-# ========================== 主界面（兼容所有Streamlit版本） ==========================
-def main_interface():
-    # 顶部标题
-    st.markdown("## 📦 集装箱智能配箱系统（多Sheet兼容）")
-    st.divider()
-    
-    # 1. 文件上传区（移除use_container_width，用列布局适配）
-    col_upload = st.columns([1])[0]
-    with col_upload:
-        uploaded_file = st.file_uploader(
-            "📁 上传Excel货物清单（支持多Sheet/多标题）",
-            type=["xlsx", "xls"]
-        )
-    
-    # 2. 数据识别区
-    if uploaded_file:
-        with st.spinner("🔍 正在解析Excel（多Sheet/多标题）..."):
-            cargo_df, sheet_names = parse_multi_sheet_excel(uploaded_file)
-            st.session_state.all_cargo = cargo_df
-        
-        if not cargo_df.empty:
-            # 显示识别结果统计
-            st.success(f"✅ 解析完成！共识别 {len(cargo_df)} 件货物（来源：{len(sheet_names)} 个Sheet）")
-            
-            # Sheet筛选（适配旧版，移除use_container_width）
-            col_filter = st.columns([0.3, 0.7])[0]
-            with col_filter:
-                selected_sheet = st.selectbox(
-                    "筛选Sheet",
-                    options=["全部"] + sheet_names
-                )
-            
-            # 筛选数据并展示
-            if selected_sheet != "全部":
-                show_df = cargo_df[cargo_df["来源Sheet"] == selected_sheet]
-            else:
-                show_df = cargo_df
-            
-            st.subheader("📋 识别结果")
-            st.dataframe(show_df, use_container_width=True)  # 这个参数所有版本都支持
-        else:
-            st.warning("⚠️ 未识别到有效货物数据，请检查Excel内容")
-    
-    # 3. 配箱计算区（持续展示）
-    if not st.session_state.all_cargo.empty:
-        st.divider()
-        st.subheader("🧮 配箱计算")
-        
-        # 柜型选择（适配旧版）
-        col_container = st.columns([0.3, 0.7])[0]
-        with col_container:
-            container_type = st.selectbox(
-                "选择集装箱类型",
-                ["20GP", "40GP", "40HQ", "45HQ"],
-                index=2
-            )
-            calculate_btn = st.button("🚀 开始配箱", type="primary")
-        
-        # 执行配箱并展示结果
-        if calculate_btn:
-            with st.spinner("📊 计算最优配箱方案..."):
-                result_df = calculate_container(st.session_state.all_cargo, container_type)
-                st.success("📦 配箱完成！")
-                
-                # 展示配箱结果
-                st.subheader("📦 配箱结果")
-                st.dataframe(result_df, use_container_width=True)
-                
-                # 导出结果（适配旧版）
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                    result_df.to_excel(writer, sheet_name=f"{container_type}配箱结果", index=False)
-                st.download_button(
-                    label="📥 下载配箱结果",
-                    data=buffer,
-                    file_name=f"集装箱配箱结果_{container_type}.xlsx"
-                )
+# ====================== 主界面 ======================
+st.title("📦 智能配箱｜Excel+PDF+图片 全兼容")
 
-# ========================== 程序入口 ==========================
-if not st.session_state.logged_in:
-    login()
-else:
-    main_interface()
+f = st.file_uploader("上传文件", type=["xlsx","xls","pdf","jpg","jpeg","png"])
+df_result = pd.DataFrame()
 
-# ========================== 页脚 ==========================
-st.divider()
-st.caption("© 2025 智能配箱系统 - 支持多Sheet/多标题 | 货代专用")
+if f:
+    try:
+        if f.name.endswith((".xlsx",".xls")):
+            df_result = parse_excel(f)
+        elif f.name.endswith(".pdf"):
+            df_result = parse_pdf(f)
+        elif f.name.endswith((".jpg",".jpeg",".png")):
+            df_result = parse_image(f)
+    except:
+        st.error("文件解析失败，请检查格式")
+
+if not df_result.empty:
+    st.success(f"识别成功：{len(df_result)} 件")
+    st.dataframe(df_result, use_container_width=True)
+
+    ct = st.selectbox("柜型", ["20GP","40GP","40HQ","45HQ"])
+    if st.button("开始配箱"):
+        res = pack(df_result, ct)
+        st.dataframe(res, use_container_width=True)
+        bio = io.BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+            res.to_excel(writer, index=False)
+        st.download_button("下载结果", bio, "配箱结果.xlsx")
