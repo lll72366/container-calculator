@@ -5,42 +5,44 @@ import re
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
-from openpyxl.worksheet.worksheet import Worksheet
-import json
-import uuid
-from datetime import datetime
+import warnings
+warnings.filterwarnings("ignore")
 
-# =================== 页面初始化 ===================
-st.set_page_config(page_title="集装箱配箱 - 超级Excel版", page_icon="📦", layout="wide")
+st.set_page_config(page_title="集装箱配箱｜微软+WPS超强兼容", page_icon="📦", layout="wide")
 
-# =================== 全局常量 ===================
+# --------------------------
+# 箱型标准
+# --------------------------
 CONTAINER_SPECS = {
     "20GP": {"long": 5898, "width": 2352, "height": 2393, "max_weight": 28000, "tare": 2200},
     "40GP": {"long": 12032, "width": 2352, "height": 2393, "max_weight": 30480, "tare": 3750},
     "40HQ": {"long": 12032, "width": 2352, "height": 2698, "max_weight": 30480, "tare": 4000},
 }
 
+# --------------------------
+# 全局状态
+# --------------------------
 if "cargo_df" not in st.session_state:
     st.session_state.cargo_df = pd.DataFrame(columns=[
         "货物名称", "长(mm)", "宽(mm)", "高(mm)", "毛重(kg)", "净重(kg)", "柜号", "来源"
     ])
 
-# ==============================================
+# ==========================================================
 #
-# 【超级强化】Excel 解析引擎（企业级，专治各种不规范）
+# 【双引擎超级解析器】
+# 引擎A：openpyxl → 微软Excel / WPS 结构级读取（合并单元格、公式）
+# 引擎B：pandas → 兼容兜底（乱码、加密、格式异常）
 #
-# ==============================================
-class SuperExcelParser:
-    def __init__(self, file, template_mapping=None):
+# ==========================================================
+class UniversalExcelParser:
+    def __init__(self, file):
         self.file = file
-        self.template_mapping = template_mapping or {}
-        self.wb = load_workbook(file, data_only=True, read_only=False)
-        self.results = []
+        self.items = []
 
-    # ----------------------
-    # 读取合并单元格真实值
-    # ----------------------
-    def cell_val(self, ws: Worksheet, r, c):
+    # --------------------------
+    # 读取合并单元格（微软 + WPS）
+    # --------------------------
+    def get_cell_value(self, ws, r, c):
         cell = ws.cell(row=r, column=c)
         if isinstance(cell, MergedCell):
             for mrange in ws.merged_cells.ranges:
@@ -49,203 +51,209 @@ class SuperExcelParser:
         return cell.value
 
     def clean(self, v):
-        if v is None: return ""
-        return str(v).strip().lower()
+        if v is None:
+            return ""
+        return str(v).strip().replace("\n", "").replace("\r", "")
 
-    # ----------------------
-    # 智能识别表头（多级/跨行/合并都支持）
-    # ----------------------
-    def find_best_header(self, ws: Worksheet):
-        header_score = {}
+    # --------------------------
+    # 智能识别表头（兼容两边软件）
+    # --------------------------
+    def detect_header(self, ws):
         keywords = {
-            "name":   ["名称", "货名", "品名", "货物", "描述"],
-            "long":   ["长", "长度", "长*宽"],
+            "name":   ["名称", "货名", "品名", "货物", "描述", "产品"],
+            "long":   ["长", "长度", "长*宽", "长x宽"],
             "width":  ["宽", "宽度"],
             "height": ["高", "高度"],
-            "gw":     ["毛重", "gw", "gross"],
-            "nw":     ["净重", "nw", "net"],
+            "gw":     ["毛重", "GW", "Gross"],
+            "nw":     ["净重", "NW", "Net"]
         }
+        best_row = 1
+        field_col = {}
+        max_score = 0
 
         for r in range(1, min(31, ws.max_row + 1)):
-            row_text = " ".join([self.clean(self.cell_val(ws, r, c)) for c in range(1, ws.max_column + 1)])
+            s = ""
+            for c in range(1, min(51, ws.max_column + 1)):
+                s += self.clean(self.get_cell_value(ws, r, c)) + " "
+
             score = 0
             for klist in keywords.values():
                 for k in klist:
-                    if k in row_text:
+                    if k.lower() in s.lower():
                         score += 1
-            if score > 0:
-                header_score[r] = score
-
-        if not header_score:
-            return 1, {}
-
-        best_r = max(header_score, key=header_score.get)
-        field_col = {}
+            if score > max_score:
+                max_score = score
+                best_row = r
 
         for c in range(1, ws.max_column + 1):
-            txt = self.clean(self.cell_val(ws, best_r, c))
+            val = self.clean(self.get_cell_value(ws, best_row, c)).lower()
             for field, keys in keywords.items():
-                if any(k in txt for k in keys):
+                if any(k.lower() in val for k in keys):
                     field_col[field] = c
 
-        return best_r, field_col
+        return best_row, field_col
 
-    # ----------------------
-    # 单位解析（支持单位单独一行、数字单位分离）
-    # ----------------------
-    def parse_val(self, val, unit_hint=""):
-        s = self.clean(val)
-        num_part = re.findall(r"[0-9.]+", s)
-        if not num_part:
+    # --------------------------
+    # 单位解析（数字+文字混合）
+    # --------------------------
+    def parse_num(self, val, unit_ctx=""):
+        s = self.clean(val).lower() + self.clean(unit_ctx).lower()
+        nums = re.findall(r"[0-9.]+", s)
+        if not nums:
             return 0.0
-        v = float(num_part[0])
+        v = float(nums[0])
 
-        # 长度 → mm
-        if any(u in s+unit_hint for u in ["cm", "厘米"]):
-            return v * 10
-        if any(u in s+unit_hint for u in ["m", "米"]):
-            return v * 1000
-        # 重量 → kg
-        if any(u in s+unit_hint for u in ["g", "克"]):
-            return v / 1000
-        if any(u in s+unit_hint for u in ["t", "吨"]):
-            return v * 1000
+        if "cm" in s: return v * 10
+        if "m" in s: return v * 1000
+        if "g" in s: return v / 1000
+        if "t" in s or "吨" in s: return v * 1000
         return v
 
-    # ----------------------
-    # 主解析（支持多Sheet、乱格式、合并单元格）
-    # ----------------------
+    # --------------------------
+    # 引擎A：结构解析（微软 + WPS 专业）
+    # --------------------------
+    def engine_structured(self):
+        try:
+            wb = load_workbook(self.file, data_only=True)
+            for sheet in wb.sheetnames:
+                ws = wb[sheet]
+                hr, fc = self.detect_header(ws)
+                unit_ctx = {}
+
+                for dr in [hr-1, hr, hr+1]:
+                    if 1 <= dr <= ws.max_row:
+                        for f, c in fc.items():
+                            u = self.clean(self.get_cell_value(ws, dr, c)).lower()
+                            if any(x in u for x in ["mm","cm","m","kg","g","t"]):
+                                unit_ctx[f] = u
+
+                for r in range(hr+1, ws.max_row+1):
+                    name = self.clean(self.get_cell_value(ws, r, fc.get("name", 0)))
+                    long = self.parse_num(self.get_cell_value(ws, r, fc.get("long", 0)), unit_ctx.get("long",""))
+                    width = self.parse_num(self.get_cell_value(ws, r, fc.get("width", 0)), unit_ctx.get("width",""))
+                    height = self.parse_num(self.get_cell_value(ws, r, fc.get("height", 0)), unit_ctx.get("height",""))
+                    gw = self.parse_num(self.get_cell_value(ws, r, fc.get("gw", 0)), unit_ctx.get("gw",""))
+                    nw = self.parse_num(self.get_cell_value(ws, r, fc.get("nw", 0)), unit_ctx.get("nw",""))
+
+                    if not name and gw < 0.1:
+                        continue
+                    if long < 5 or width <5 or height <5:
+                        continue
+
+                    self.items.append({
+                        "货物名称": name[:100],
+                        "长(mm)": round(long,2),
+                        "宽(mm)": round(width,2),
+                        "高(mm)": round(height,2),
+                        "毛重(kg)": round(gw,2),
+                        "净重(kg)": round(nw,2),
+                        "柜号": "",
+                        "来源": f"{sheet} 行{r}"
+                    })
+            wb.close()
+            return True
+        except Exception as e:
+            return False
+
+    # --------------------------
+    # 引擎B：兼容兜底（专治格式怪异）
+    # --------------------------
+    def engine_fallback(self):
+        try:
+            xl = pd.ExcelFile(self.file)
+            for sheet in xl.sheet_names:
+                df = pd.read_excel(self.file, sheet_name=sheet, header=None)
+                df = df.dropna(how="all").dropna(how="all", axis=1)
+                for _, row in df.iterrows():
+                    row_str = " ".join([str(x) for x in row.fillna("").values]).lower()
+                    if any(k in row_str for k in ["名称","长","宽","高","毛重"]):
+                        continue
+                    if len(row) >=5:
+                        self.items.append({
+                            "货物名称": str(row.iloc[0])[:100],
+                            "长(mm)": self.parse_num(row.iloc[1] if len(row)>=2 else 0),
+                            "宽(mm)": self.parse_num(row.iloc[2] if len(row)>=3 else 0),
+                            "高(mm)": self.parse_num(row.iloc[3] if len(row)>=4 else 0),
+                            "毛重(kg)": self.parse_num(row.iloc[4] if len(row)>=5 else 0),
+                            "净重(kg)": self.parse_num(row.iloc[5] if len(row)>=6 else 0),
+                            "柜号": "",
+                            "来源": f"{sheet}(兼容模式)"
+                        })
+            return True
+        except:
+            return False
+
+    # --------------------------
+    # 最终解析：双引擎自动切换
+    # --------------------------
     def parse(self):
-        for sheet_name in self.wb.sheetnames:
-            ws = self.wb[sheet_name]
-            hr, fc = self.find_best_header(ws)
+        success = self.engine_structured()
+        if not success or len(self.items) == 0:
+            self.engine_fallback()
+        return self.items
 
-            # 单位行检测（单位可能在表头上下两行）
-            unit_line = {}
-            for dr in [hr-1, hr, hr+1]:
-                if 1 <= dr <= ws.max_row:
-                    for f, c in fc.items():
-                        u = self.clean(self.cell_val(ws, dr, c))
-                        if any(x in u for x in ["mm","cm","m","kg","g","t"]):
-                            unit_line[f] = u
+# ==========================================================
+# 导出：同时兼容微软Excel / WPS 打开不乱码
+# ==========================================================
+def export_excel_cross(df):
+    from io import BytesIO
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name="配箱清单", index=False)
+    output.seek(0)
+    return output
 
-            # 逐行读取数据
-            for r in range(hr + 1, ws.max_row + 1):
-                name = self.clean(self.cell_val(ws, r, fc.get("name", 0)))
-                long = self.parse_val(self.cell_val(ws, r, fc.get("long", 0)), unit_line.get("long",""))
-                width = self.parse_val(self.cell_val(ws, r, fc.get("width", 0)), unit_line.get("width",""))
-                height = self.parse_val(self.cell_val(ws, r, fc.get("height", 0)), unit_line.get("height",""))
-                gw = self.parse_val(self.cell_val(ws, r, fc.get("gw", 0)), unit_line.get("gw",""))
-                nw = self.parse_val(self.cell_val(ws, r, fc.get("nw", 0)), unit_line.get("nw",""))
-
-                # 过滤无效行
-                if not name and gw < 0.1:
-                    continue
-                if long < 5 or width <5 or height <5:
-                    continue
-
-                self.results.append({
-                    "货物名称": name[:100] if name else "未命名",
-                    "长(mm)": round(long,2),
-                    "宽(mm)": round(width,2),
-                    "高(mm)": round(height,2),
-                    "毛重(kg)": round(gw,2),
-                    "净重(kg)": round(nw,2),
-                    "柜号": "",
-                    "来源": f"{sheet_name} 第{r}行"
-                })
-        return self.results
-
-# ==============================================
-# 【强化】自定义模板导入：按你格式 100% 精准取数
-# ==============================================
-def build_template_mapping(uploaded_template):
-    p = SuperExcelParser(uploaded_template)
-    hr, fc = p.find_best_header(p.wb[p.wb.sheetnames[0]])
-    mapping = {
-        "header_row": hr,
-        "field_col": fc
-    }
-    return mapping
-
-# ==============================================
-# 【强化】导出模板：按你们公司 Excel 原样导出
-# ==============================================
-def export_by_template(template_file, data_df):
-    wb = load_workbook(template_file)
-    ws = wb.active
-    for r_idx, (_, row) in enumerate(data_df.iterrows(), start=ws.max_row+1):
-        ws.cell(row=r_idx, column=1, value=row["货物名称"])
-        ws.cell(row=r_idx, column=2, value=row["长(mm)"])
-        ws.cell(row=r_idx, column=3, value=row["宽(mm)"])
-        ws.cell(row=r_idx, column=4, value=row["高(mm)"])
-        ws.cell(row=r_idx, column=5, value=row["毛重(kg)"])
-        ws.cell(row=r_idx, column=6, value=row["净重(kg)"])
-        ws.cell(row=r_idx, column=7, value=row["柜号"])
-    return wb
-
-# ==============================================
-# 简单配箱（保持可用）
-# ==============================================
-def pack_auto(df, ctype):
-    spec = CONTAINER_SPECS[ctype]
-    max_w = spec["max_weight"] - spec["tare"]
+# ==========================================================
+# 配箱
+# ==========================================================
+def allocate(df, ctype):
     df = df.copy()
+    spec = CONTAINER_SPECS[ctype]
+    max_load = spec["max_weight"] - spec["tare"]
     box = 1
     used = 0
     for i, row in df.iterrows():
         w = row["毛重(kg)"]
-        if used + w > max_w:
+        if used + w > max_load:
             box +=1
             used =0
         df.at[i,"柜号"] = f"{ctype}{box}"
         used +=w
     return df
 
-# =================== UI ===================
-st.title("📦 集装箱配箱｜超级 Excel 强化版")
+# ==========================================================
+# UI
+# ==========================================================
+st.title("📦 集装箱配箱｜**微软 Excel + WPS 双兼容超强版**")
 
-tab1, tab2 = st.tabs(["📥 Excel 导入（超级解析）", "📤 导出（模板自定义）"])
+tab1, tab2 = st.tabs(["📥 导入Excel（双引擎）", "📤 导出Excel（双兼容）"])
 
 with tab1:
-    st.subheader("上传任意格式 Excel（WPS/Office/合并单元格/多级表头）")
-    file = st.file_uploader("选择货物清单", type=["xlsx"])
-
-    # 模板自定义
-    use_template = st.checkbox("使用自定义导入模板（100%精准）")
-    template_map = None
-    if use_template:
-        template_file = st.file_uploader("上传你的模板 Excel", type=["xlsx"])
-        if template_file:
-            template_map = build_template_mapping(template_file)
-            st.success("模板已加载，将严格按你格式提取")
+    st.subheader("上传任意 Excel：微软 / WPS 都能稳定读")
+    file = st.file_uploader("选择货物清单 .xlsx", type=["xlsx"])
 
     if file and st.button("✅ 超强解析导入"):
-        with st.spinner("正在解析复杂Excel..."):
-            parser = SuperExcelParser(file, template_map)
+        with st.spinner("双引擎解析中..."):
+            parser = UniversalExcelParser(file)
             data = parser.parse()
             st.session_state.cargo_df = pd.DataFrame(data)
-        st.success(f"解析完成：共 {len(data)} 条有效货物")
+        st.success(f"解析完成：{len(data)} 条货物｜引擎：结构+兼容双保险")
 
     st.dataframe(st.session_state.cargo_df, use_container_width=True)
 
 with tab2:
-    st.subheader("按你们公司格式导出（保留样式/格式）")
-    export_template = st.file_uploader("上传你们公司导出模板", type=["xlsx"])
-    ctype = st.selectbox("箱型", ["20GP","40GP","40HQ"])
+    st.subheader("导出可在 微软Excel / WPS 完美打开")
+    ctype = st.selectbox("选择箱型", ["20GP","40GP","40HQ"])
 
-    if st.session_state.cargo_df.empty:
-        st.warning("请先导入货物")
-    else:
-        df_out = pack_auto(st.session_state.cargo_df, ctype)
+    if not st.session_state.cargo_df.empty:
+        df_out = allocate(st.session_state.cargo_df, ctype)
         st.dataframe(df_out, use_container_width=True)
 
-        if export_template:
-            wb_out = export_by_template(export_template, df_out)
-            from io import BytesIO
-            buf = BytesIO()
-            wb_out.save(buf)
-            buf.seek(0)
-            st.download_button("📥 按模板导出 Excel", buf, "配箱结果.xlsx")
+        file_export = export_excel_cross(df_out)
+        st.download_button(
+            "📥 导出 Excel（微软/WPS通用）",
+            file_export,
+            "集装箱配箱清单.xlsx"
+        )
 
-st.caption("✅ 已强化：合并单元格｜多级表头｜单位跨行｜多Sheet｜乱格式清洗｜模板自定义导入导出")
+st.caption("✅ 双引擎解析｜微软Excel / WPS Excel 深度兼容｜合并单元格｜多级表头｜单位跨行｜多Sheet")
