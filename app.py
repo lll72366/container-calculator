@@ -1,4 +1,24 @@
 import streamlit as st
+
+# 密码验证
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state["password_correct"] = False
+    
+    if not st.session_state["password_correct"]:
+        password = st.text_input("请输入访问密码", type="password")
+        if password == "123456":  # 替换成你想设置的密码
+            st.session_state["password_correct"] = True
+            st.rerun()
+        else:
+            st.error("密码错误，请联系管理员")
+            return False
+    return True
+
+if not check_password():
+    st.stop()
+
+import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime
