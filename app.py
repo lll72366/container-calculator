@@ -15,7 +15,7 @@ st.set_page_config(
 
 # ====================== 管理员登录配置 ======================
 ADMIN_USER = "admin"  # 可自定义账号
-ADMIN_PWD_HASH = hashlib.md5(b"admin123".encode()).hexdigest()  # 密码是 admin123，可修改
+ADMIN_PWD_HASH = hashlib.md5(b"admin123").hexdigest()  # 密码是 admin123，可修改
 
 # ====================== 集装箱规格（支持手动选择） ======================
 CONTAINER_SPECS = {
